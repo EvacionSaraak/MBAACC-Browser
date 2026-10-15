@@ -28,4 +28,9 @@ Enable Pages: repository Settings → Pages → Source: **GitHub Actions**.
 No game executables, sprites, audio or other proprietary assets may be committed (`.gitignore` blocks common extensions). No fake demos or recorded video presented as gameplay.
 
 ## Roadmap
+Startup crash investigation and the source-only BottleShip tracing patch:
+[docs/RUNTIME-DEBUGGING.md](docs/RUNTIME-DEBUGGING.md),
+[runtime/README.md](runtime/README.md). A related browser startup crash was
+reproduced; no fix or title-screen compatibility is claimed.
+
 See [docs/ROADMAP.md](docs/ROADMAP.md). Third-party licenses: [THIRD_PARTY.md](THIRD_PARTY.md). This project is MIT licensed (see [LICENSE](LICENSE)) and is unaffiliated with the MBAACC rights holders.

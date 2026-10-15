@@ -1,0 +1,484 @@
+diff --git a/src/guest-report.ts b/src/guest-report.ts
+index b737147..d6b2bfb 100644
+--- a/src/guest-report.ts
++++ b/src/guest-report.ts
+@@ -81,6 +81,7 @@ export interface CrashFault {
+   }>;
+   schedulerDetail?: string | null;
+   asyncRestoreTrace?: string[];
++  callbackFlowTrace?: string[];
+   crashThreadCalls?: string[];
+   wildEsp?: string | null;
+   wildEbp?: string | null;
+@@ -243,6 +244,9 @@ export function formatGuestReport(f: CrashFault, gameName: string, crashed: bool
+   if (f.sehDispatchTrace?.length) {
+     lines.push(``, `recent SEH catch dispatches (newest last):`, ...f.sehDispatchTrace.map((t) => `  ${t}`));
+   }
++  if (f.callbackFlowTrace?.length) {
++    lines.push(``, `callback control-flow trace (newest last):`, ...f.callbackFlowTrace.map(t => `  ${t}`));
++  }
+   if (f.asyncRestoreTrace?.length) {
+     lines.push(``, `async restore trace (newest last):`, ...f.asyncRestoreTrace.map((t) => `  ${t}`));
+   }
+diff --git a/src/worker/core/debug/dbg-commands.ts b/src/worker/core/debug/dbg-commands.ts
+index d284303..f5399b4 100644
+--- a/src/worker/core/debug/dbg-commands.ts
++++ b/src/worker/core/debug/dbg-commands.ts
+@@ -22,6 +22,7 @@
+  *        // then window.loadApp('/apps/ut_demo.wgb')
+  */
+ 
++import { callbackFlow } from '../diagnostics/callback-flow';
+ import { System } from '../system';
+ import { Galaxy } from '../../modules/galaxy';
+ import { libHleManager } from '../hle-lib/lib-hle-manager';
+@@ -184,6 +185,9 @@ let readTlbMark: { hit: number; fill: number; atMs: number; mode: number; codePa
+ let eaglTokenMarkState: { enter: number; handled: number; decline: number; skip: number; tier0: number; tier0Mode: number } | null = null;
+ 
+ export const dbg = {
++    /** Arm before game load; records only scalar control-flow metadata, never guest payloads. */
++    callbackFlow(enabled = true) { callbackFlow.configure(enabled); return callbackFlow.snapshot(); },
++    callbackFlowReport() { return callbackFlow.snapshot(); },
+     /** Enable the debugger. Turns JIT OFF (required) and clears the JIT cache. */
+     enable(): void {
+         cfg.enabled = true;
+diff --git a/src/worker/core/diagnostics/callback-flow.ts b/src/worker/core/diagnostics/callback-flow.ts
+new file mode 100644
+index 0000000..8567f05
+--- /dev/null
++++ b/src/worker/core/diagnostics/callback-flow.ts
+@@ -0,0 +1,50 @@
++/** Opt-in, bounded control-flow telemetry. Never stores guest bytes or argument payloads. */
++export interface CallbackFlowEvent {
++    phase: 'frame-save' | 'callback-invoke' | 'callback-return' | 'frame-restore' |
++        'direct-restore' | 'com-create' | 'com-hle-result' | 'async-before' | 'async-after' | 'dialog-entry' | 'variant-init';
++    threadId: number;
++    eip?: number;
++    esp?: number;
++    targetEip?: number;
++    returnEip?: number;
++    expectedEsp?: number;
++    cleanupBytes?: number;
++    callbackId?: number;
++    frameId?: number;
++    stubAddress?: number;
++    depth?: number;
++    pointer?: number;
++    pointerValid?: boolean;
++    argCount?: number;
++    clsid?: string;
++    iid?: string;
++    result?: number;
++    objectPointer?: number;
++}
++export class CallbackFlowTrace {
++    private enabled = false;
++    private records: Array<CallbackFlowEvent & { sequence: number }> = [];
++    private sequence = 0;
++    private next = 0;
++    constructor(private readonly capacity = 128) {
++        if (!Number.isInteger(capacity) || capacity < 1 || capacity > 4096) throw new Error('Invalid callback trace capacity');
++    }
++    isEnabled(): boolean { return this.enabled; }
++    configure(enabled: boolean): void { this.enabled = enabled; this.clear(); }
++    clear(): void { this.records = []; this.sequence = 0; this.next = 0; }
++    record(event: CallbackFlowEvent): void {
++        if (!this.enabled) return;
++        this.records[this.next] = { ...event, sequence: ++this.sequence };
++        this.next = (this.next + 1) % this.capacity;
++    }
++    snapshot() {
++        const records = this.records.length === this.capacity
++            ? [...this.records.slice(this.next), ...this.records.slice(0, this.next)] : this.records;
++        return { enabled: this.enabled, dropped: Math.max(0, this.sequence - this.capacity),
++            events: records.map(event => ({ ...event })) };
++    }
++}
++export const callbackFlow = new CallbackFlowTrace();
++
++// Explicit local development opt-in; production builds are silent by default.
++if (import.meta.env?.VITE_BS_CALLBACK_FLOW === "1") callbackFlow.configure(true);
+diff --git a/src/worker/core/system.ts b/src/worker/core/system.ts
+index 625ded5..58b8606 100644
+--- a/src/worker/core/system.ts
++++ b/src/worker/core/system.ts
+@@ -1,3 +1,4 @@
++import { callbackFlow } from './diagnostics/callback-flow';
+ 
+ import { Process } from "./process";
+ import { stopChildProcesses, hasChildSession } from "./child-process";
+@@ -73,6 +74,7 @@ export interface CrashFaultPayload {
+     schedulerDetail?: string | null;
+     /** Recent async restore / scheduler events, newest last. */
+     asyncRestoreTrace?: string[];
++    callbackFlowTrace?: string[];
+     /** Recent WinAPI calls made by the CRASHING thread (oldest..newest), each tagged
+      *  with ESP + [esp]. Isolated from a busy peer thread that floods the global ring;
+      *  reveals a wild/corrupt ESP directly. */
+@@ -706,6 +708,9 @@ export class System {
+             } | undefined;
+             fault.schedulerDetail = sched?.getDetailedThreadInfo?.() ?? null;
+             fault.asyncRestoreTrace = sched?.getAsyncRestoreTrace?.().slice(-32) ?? [];
++            const flow = callbackFlow.snapshot();
++            fault.callbackFlowTrace = flow.enabled
++                ? [`enabled=true dropped=${flow.dropped}`, ...flow.events.map(e => JSON.stringify(e))] : [];
+ 
+             if (fault.threadId != null && dispatcher?.getLastWinApiCallsForThread) {
+                 fault.crashThreadCalls = dispatcher.getLastWinApiCallsForThread(fault.threadId, 24);
+diff --git a/src/worker/core/thunking/callback-manager.ts b/src/worker/core/thunking/callback-manager.ts
+index 1eb259f..deee86a 100644
+--- a/src/worker/core/thunking/callback-manager.ts
++++ b/src/worker/core/thunking/callback-manager.ts
+@@ -12,6 +12,7 @@
+ //
+ // The return stub handles the stack cleanup that the original WinAPI thunk would have done.
+ 
++import { callbackFlow } from '../diagnostics/callback-flow';
+ import { ThunkGenerator } from './thunk-generator';
+ import { Logger, LogCategory } from '../logger';
+ import { System } from '../system';
+@@ -501,6 +502,12 @@ export class CallbackManager {
+ 
+         const returnValue = view.getUint32(esp, true);
+         let callerRet = view.getUint32(esp + 4, true) >>> 0;
++        if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'callback-return',
++            threadId: System.getInstance().scheduler.getCurrentThreadId() >>> 0,
++            callbackId: functionId >>> 0, frameId: callback.frameId ?? 0,
++            targetEip: callback.callbackAddress, stubAddress: stub.address,
++            eip, esp, returnEip: callerRet, expectedEsp: (callback.espBeforeInvoke ?? esp + 4) - 4,
++            cleanupBytes: callback.callerCleanup, depth: this.frameStackDepth });
+         let callerRetInStubPool = callerRet >= this.stubPoolBase && callerRet < this.stubPoolEnd;
+         let callerRetLowAddress = callerRet < 0x100000;
+         let callerRetInStack = this.isGuestStackAddress(callerRet);
+@@ -626,6 +633,10 @@ export class CallbackManager {
+                 return;
+             }
+ 
++            if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'direct-restore',
++                threadId: callback.ownerThreadId ?? 0, callbackId: functionId >>> 0,
++                eip: cpu.instruction_pointer[0] >>> 0, esp: cpu.reg32[4] >>> 0,
++                returnEip: returnAddr, expectedEsp: postEsp, depth: this.frameStackDepth });
+             cpu.reg32[0] = finalValue >>> 0;
+             cpu.reg32[4] = postEsp;
+             if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
+@@ -722,6 +733,11 @@ export class CallbackManager {
+                 return;
+             }
+ 
++            if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'frame-restore',
++                threadId, callbackId: functionId >>> 0, frameId,
++                eip: cpu.instruction_pointer[0] >>> 0, esp: cpu.reg32[4] >>> 0,
++                returnEip: returnAddr, expectedEsp: targetEsp,
++                cleanupBytes: this.frameThunkCleanup[frameIndex], depth: this.frameStackDepth });
+             const preWriteEsp = cpu.reg32[4];
+             const preWriteEip = cpu.instruction_pointer?.[0] ?? 0;
+             this.restoreCalleeSavedAcrossCallback(frameIndex, frameId, this.frameSource[frameIndex] ?? '');
+@@ -1242,6 +1258,9 @@ export class CallbackManager {
+         Logger.verbose(LogCategory.CALLBACK,
+             `Saved suspended thunk frame ${frameId} (depth=${this.frameStackDepth}): ` +
+             `T${threadId} ESP=0x${esp.toString(16)} RET=0x${returnAddr.toString(16)} cleanup=${stackCleanup}`);
++        if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'frame-save', threadId,
++            frameId, esp, returnEip: returnAddr, expectedEsp: esp + 4 + stackCleanup,
++            cleanupBytes: stackCleanup, depth: this.frameStackDepth });
+         return frameId;
+     }
+ 
+@@ -1475,6 +1494,11 @@ export class CallbackManager {
+             invocation.ownerThreadId ?? 0,
+             callbackAddress >>> 0
+         );
++        if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'callback-invoke',
++            threadId: invocation.ownerThreadId ?? 0, callbackId: stub.callbackId >>> 0,
++            frameId: resolvedFrameId, targetEip: callbackAddress, esp,
++            expectedEsp: espBeforeInvoke - 4, cleanupBytes: callerCleanup,
++            stubAddress: stub.address, depth: this.frameStackDepth });
+         this.lastInvokeForensics = {
+             phase: 'invoke',
+             ts: performance.now(),
+diff --git a/src/worker/core/thunking/thunk-dispatcher.ts b/src/worker/core/thunking/thunk-dispatcher.ts
+index ddd29aa..08b56b1 100644
+--- a/src/worker/core/thunking/thunk-dispatcher.ts
++++ b/src/worker/core/thunking/thunk-dispatcher.ts
+@@ -45,6 +45,7 @@ import { apiCensus, isHresultThunk } from '../diagnostics/api-census';
+ import { MEM_THUNK_CODE_BASE, MEM_THUNK_DATA_BASE, MEM_THUNK_DATA_SIZE } from '../cpu/emulator-config';
+ import type { Scheduler } from '../scheduler/scheduler';
+ import { ThunkBoundaryKind } from '../scheduler/types';
++import { callbackFlow } from '../diagnostics/callback-flow';
+ import type { PendingAsyncRestoreDescriptor } from './types/async-restore';
+ import { TimeService } from '../../runtime/time';
+ import { debugSession } from '../debug/debug-session';
+@@ -1046,6 +1047,8 @@ export class ThunkDispatcher {
+     }
+ 
+     public dumpCriticalForensics(reason: string): void {
++        if (callbackFlow.isEnabled()) Logger.error(LogCategory.SYSTEM,
++            `[CALLBACK FLOW] ${JSON.stringify(callbackFlow.snapshot())}`);
+         this.logCallbackForensics(reason);
+         this.dumpShadowStackGuard(reason);
+     }
+@@ -4161,6 +4164,9 @@ export class ThunkDispatcher {
+             this.applyDeferredWrites(deferredWrites, esp, name);  // < Use original ESP, not newEsp!
+         }
+ 
++        if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'async-before',
++            threadId: info.threadId ?? 0, eip: cpu.instruction_pointer[0] >>> 0,
++            esp: cpu.reg32[4] >>> 0, returnEip: eipLinear, expectedEsp: finalEsp, cleanupBytes });
+         // Now simulate RET N through scheduler-owned CPU mutation path.
+         const scheduler = this.ensureScheduler();
+         if (!scheduler.applyAsyncRestoreCpuState(cpu, eipLinear, finalEsp, returnValue >>> 0, `async_restore:${name}`, {
+@@ -4173,6 +4179,9 @@ export class ThunkDispatcher {
+             return;
+         }
+ 
++        if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'async-after',
++            threadId: info.threadId ?? 0, eip: cpu.instruction_pointer[0] >>> 0,
++            esp: cpu.reg32[4] >>> 0, returnEip: eipLinear, expectedEsp: finalEsp, cleanupBytes });
+         this.lastExpectedEspAfterReturn = finalEsp;
+         this.lastThunkIdAfterReturn = info.functionId;
+         this.lastThunkNameAfterReturn = name;
+diff --git a/src/worker/modules/ole32.ts b/src/worker/modules/ole32.ts
+index 173ea2d..1f79ab4 100644
+--- a/src/worker/modules/ole32.ts
++++ b/src/worker/modules/ole32.ts
+@@ -1,3 +1,4 @@
++import { callbackFlow } from '../core/diagnostics/callback-flow';
+ import { IModule } from "../core/module";
+ import { Process } from "../core/process";
+ import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
+@@ -185,18 +186,30 @@ export class Ole32 implements IModule {
+             }
+ 
+             // Generic native inproc COM (registry / ROM DLL → DllGetClassObject chain)
++            const flowThreadId = callbackFlow.isEnabled() ? System.getInstance().scheduler.getCurrentThreadId() >>> 0 : 0;
++            if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'com-create',
++                threadId: System.getInstance().scheduler.getCurrentThreadId() >>> 0,
++                esp: ctx.esp >>> 0, clsid: clsidNormalized, iid: iidNormalized, pointer: ppv >>> 0 });
++            const hle = () => {
++                const result = this.coCreateInstanceHle(mem, ppv, clsidStr, iidStr, clsidNormalized, iidNormalized);
++                if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'com-hle-result',
++                    threadId: flowThreadId,
++                    clsid: clsidNormalized, iid: iidNormalized, result: result >>> 0,
++                    objectPointer: ppv > 0 && ppv + 4 <= mem.length ? view.getUint32(ppv, true) : undefined });
++                return result;
++            };
+             const inprocArgs = { rclsid, riid, ppv, clsidNormalized };
+             const inprocResult = tryInprocCoCreateInstance(this.process, ctx, mem, inprocArgs);
+             if (inprocResult !== null) {
+                 if (inprocResult instanceof Promise) {
+                     return inprocResult.then((r) =>
+-                        r ?? this.coCreateInstanceHle(mem, ppv, clsidStr, iidStr, clsidNormalized, iidNormalized),
++                        r ?? hle(),
+                     );
+                 }
+                 return inprocResult;
+             }
+ 
+-            return this.coCreateInstanceHle(mem, ppv, clsidStr, iidStr, clsidNormalized, iidNormalized);
++            return hle();
+         }) as ThunkImplementation;
+ 
+         // CoSetProxyBlanket - set authentication on a proxy. Everything here is
+diff --git a/src/worker/modules/oleaut32.ts b/src/worker/modules/oleaut32.ts
+index 9297290..23bc84b 100644
+--- a/src/worker/modules/oleaut32.ts
++++ b/src/worker/modules/oleaut32.ts
+@@ -1,3 +1,4 @@
++import { callbackFlow } from '../core/diagnostics/callback-flow';
+ import { IModule } from "../core/module";
+ import { Process } from "../core/process";
+ import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
+@@ -190,6 +191,10 @@ export class Oleaut32 implements IModule {
+ 
+         this.exports["ord_8"] = (ctx, mem, args) => {
+             const pvarg = args[0] >>> 0;
++            if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'variant-init',
++                threadId: System.getInstance().scheduler.getCurrentThreadId() >>> 0,
++                esp: ctx.esp >>> 0, pointer: pvarg, pointerValid: !!pvarg && pvarg + 16 <= mem.length,
++                argCount: args.length, cleanupBytes: 4 });
+             if (pvarg && pvarg + 16 <= mem.length) {
+                 mem.fill(0, pvarg, pvarg + 16);
+             }
+diff --git a/src/worker/modules/user32/dialog.ts b/src/worker/modules/user32/dialog.ts
+index beae73f..cae26d3 100644
+--- a/src/worker/modules/user32/dialog.ts
++++ b/src/worker/modules/user32/dialog.ts
+@@ -5,6 +5,7 @@
+  * DialogBoxParam uses callback chaining (same pattern as CreateWindowEx) to invoke dlgProc.
+  */
+ 
++import { callbackFlow } from '../../core/diagnostics/callback-flow';
+ import { ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
+ import { Logger, LogCategory } from '../../core/logger';
+ import { Marshaler } from '../../core/memory/marshaler';
+@@ -1359,6 +1360,9 @@ function createModelessDialog(
+     callerStackCleanup: number = 5 * 4,
+ ): any {
+     const system = System.getInstance();
++    if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'dialog-entry',
++        threadId: system.scheduler.getCurrentThreadId() >>> 0, esp: ctx.esp >>> 0,
++        targetEip: lpDialogFunc >>> 0, cleanupBytes: callerStackCleanup });
+     const mem = system.process?.v86?.mem8 ?? system.process?.v86?.v86?.cpu?.mem8;
+ 
+     // Parse template if pointer provided
+diff --git a/tools/tests/callback-flow.test.ts b/tools/tests/callback-flow.test.ts
+new file mode 100644
+index 0000000..a608004
+--- /dev/null
++++ b/tools/tests/callback-flow.test.ts
+@@ -0,0 +1,21 @@
++import { describe, expect, test } from 'bun:test';
++import { CallbackFlowTrace } from '../../src/worker/core/diagnostics/callback-flow';
++
++describe('callback control-flow telemetry', () => {
++    test('disabled by default and bounded when armed', () => {
++        const ring = new CallbackFlowTrace(2);
++        ring.record({phase: 'frame-save', threadId: 1});
++        expect(ring.snapshot()).toEqual({enabled: false, dropped: 0, events: []});
++        ring.configure(true);
++        for (let i = 1; i <= 3; i++) ring.record({phase: 'frame-save', threadId: i});
++        expect(ring.snapshot().events.map(e => e.threadId)).toEqual([2, 3]);
++        expect(ring.snapshot().dropped).toBe(1);
++        ring.snapshot().events[0]!.threadId = 99;
++        expect(ring.snapshot().events[0]!.threadId).toBe(2);
++        ring.configure(false);
++        expect(ring.snapshot().events).toHaveLength(0);
++    });
++    test('rejects unbounded or invalid capacity', () => {
++        for (const n of [0, -1, 1.5, 4097, Infinity]) expect(() => new CallbackFlowTrace(n)).toThrow();
++    });
++});
+diff --git a/tools/tests/dxdiag-availability.test.ts b/tools/tests/dxdiag-availability.test.ts
+new file mode 100644
+index 0000000..3b9a3bd
+--- /dev/null
++++ b/tools/tests/dxdiag-availability.test.ts
+@@ -0,0 +1,16 @@
++import { expect, test } from 'bun:test';
++import { Ole32 } from '../../src/worker/modules/ole32';
++
++test('DxDiag provider is currently unsupported, returning an error and a null object', () => {
++    const ole32 = new Ole32();
++    (ole32 as any).process = {modules: new Map()};
++    const mem = new Uint8Array(0x1000), out = 0x100;
++    const view = new DataView(mem.buffer);
++    view.setUint32(out, 0xfeedface, true);
++    // Microsoft dxdiag.h, not extracted game content.
++    const clsid = 'a65b8071-3bfe-4213-9a5b-491da4461ca7';
++    const iid = '9c6b4cb0-23f8-49cc-a3ed-45a55000a6d2';
++    const hr = (ole32 as any).coCreateInstanceHle(mem, out, clsid, iid, clsid, iid);
++    expect(hr >>> 0).toBe(0x80040154);
++    expect(view.getUint32(out, true)).toBe(0);
++});
+diff --git a/tools/tests/nested-dialog-x86.test.ts b/tools/tests/nested-dialog-x86.test.ts
+new file mode 100644
+index 0000000..5b07bb4
+--- /dev/null
++++ b/tools/tests/nested-dialog-x86.test.ts
+@@ -0,0 +1,107 @@
++/** Handwritten synthetic x86, no game bytes. Runs the real v86 CPU and CallbackManager.
++ * The API entry is a modeless-dialog ABI seam, not the full user32 window implementation.
++ */
++import { expect, test } from 'bun:test';
++import { V86 } from '../../vendor/v86/build/libv86.mjs';
++import { CallbackManager } from '../../src/worker/core/thunking/callback-manager';
++import { System } from '../../src/worker/core/system';
++import { Mem } from '../../src/worker/core/memory/mem-accessor';
++import { Oleaut32 } from '../../src/worker/modules/oleaut32';
++import { callbackFlow } from '../../src/worker/core/diagnostics/callback-flow';
++
++test('nested modeless-dialog ABI callbacks call VariantInit and return to the original EIP/ESP', async () => {
++    const BASE = 0x100000, STACK = 0x300000, PORT = 0xb077;
++    const OUTER = BASE + 0x200, INNER = BASE + 0x300;
++    const DIALOG = BASE + 0x400, NESTED = BASE + 0x420, VARIANT = BASE + 0x440;
++    const image = new Uint8Array(0x1000), view = new DataView(image.buffer);
++    const MAGIC = 0x1badb002, FLAGS = 0x10000;
++    [MAGIC, FLAGS, -(MAGIC + FLAGS), BASE, BASE, BASE + image.length, BASE + image.length, BASE + 0x40]
++        .forEach((v, i) => view.setUint32(i * 4, v >>> 0, true));
++    let at = 0;
++    const emit = (...bytes: number[]) => { for (const b of bytes) image[at++] = b; };
++    const dword = (v: number) => { view.setUint32(at, v >>> 0, true); at += 4; };
++    const mov = (reg: number, value: number) => { emit(0xb8 + reg); dword(value); };
++    const call = (address: number) => { emit(0xe8); dword(address - (BASE + at + 4)); };
++    const args5 = () => { for (let i = 0; i < 5; i++) emit(0x6a, i); };
++    const variant = () => { emit(0x83, 0xec, 16, 0x54); call(VARIANT); emit(0x83, 0xc4, 16); };
++    at = 0x40;
++    mov(4, STACK); mov(3, 0x11223344); mov(6, 0x22334455); mov(7, 0x33445566); mov(5, 0x44556677);
++    args5(); call(DIALOG);
++    const DONE = BASE + at;
++    emit(0xf4, 0xeb, 0xfe);
++    at = OUTER - BASE;
++    emit(0x55, 0x89, 0xe5, 0x53, 0x56, 0x57); // save callee-saved registers
++    args5(); call(NESTED); variant();
++    emit(0x5f, 0x5e, 0x5b, 0x5d); mov(0, 1); emit(0xc2, 16, 0);
++    at = INNER - BASE;
++    emit(0x55, 0x89, 0xe5, 0x53, 0x56, 0x57); variant();
++    emit(0x5f, 0x5e, 0x5b, 0x5d); mov(0, 2); emit(0xc2, 16, 0);
++    for (const [address, id, pop] of [[DIALOG, 1, 20], [NESTED, 2, 20], [VARIANT, 3, 4]]) {
++        at = address - BASE;
++        mov(0, id!); mov(2, PORT); emit(0xef, 0xc2, pop!, 0);
++    }
++    const system = System.getInstance();
++    const saved = {process: system.process, scheduler: system.scheduler, exiting: system.isExiting};
++    const emulator = new V86({autostart: false, memory_size: 16 * 1024 * 1024, log_level: 0});
++    let manager: CallbackManager | undefined;
++    let variantCalls = 0, dialogs = 0;
++    callbackFlow.configure(true);
++    try {
++        await new Promise<void>((resolve, reject) => {
++            const timer = setTimeout(() => reject(new Error('Synthetic guest did not halt')), 5000);
++            emulator.bus.register('cpu-event-halt', () => { clearTimeout(timer); resolve(); });
++            emulator.add_listener('emulator-loaded', () => {
++                try {
++                    const cpu = emulator.v86.cpu;
++                    cpu.reboot_internal(); cpu.reset_memory(); cpu.load_multiboot(image.buffer);
++                    const mem = cpu.mem8 as Uint8Array;
++                    Mem.bind(() => mem);
++                    system.scheduler = {
++                        getCurrentThreadId: () => 1,
++                        getThreadStackBounds: () => ({base: STACK - 0x10000, top: STACK + 4}),
++                        pinCurrentThread() {}, unpinThread() {}, wakeCurrentThreadForCallbackDispatch() {},
++                        reportCallbackFrameFatal() { throw new Error('Callback frame fatal'); },
++                        reportFatalGuard() { throw new Error('Callback fatal guard'); },
++                    } as any;
++                    system.process = {addressSpace: {validateRange: (p: number, n: number) => p > 0 && p + n <= mem.length}} as any;
++                    system.isExiting = false;
++                    manager = new CallbackManager({cpu}, {} as any, () => mem);
++                    manager.initialize({getRegions: () => ({callbackStubPoolBase: 0x200000, callbackStubPoolSize: 0x4000})} as any);
++                    const oleaut = new Oleaut32();
++                    (oleaut as any).typeLibRuntime.initialize = () => {};
++                    oleaut.initialize({} as any);
++                    cpu.io.register_write(PORT, cpu, undefined, undefined, (id: number) => {
++                        try {
++                            const esp = cpu.reg32[4] >>> 0;
++                            if (manager!.isCallbackReturn(id >>> 0)) manager!.handleCallbackReturn(id >>> 0);
++                            else if (id === 3) {
++                                const ptr = new DataView(mem.buffer).getUint32(esp + 4, true);
++                                oleaut.exports.ord_8!({esp} as any, mem, [ptr]);
++                                variantCalls++;
++                                cpu.reg32[0] = 0;
++                            } else {
++                                dialogs++;
++                                const frame = manager!.saveSuspendedThunkContext({esp}, 20, 'synthetic-modeless-dialog');
++                                manager!.invokeCallback(id === 1 ? OUTER : INNER, [1, 0x110, 0, 0], 0,
++                                    () => 0x10000 + id, false, 'synthetic-WM_INITDIALOG', frame);
++                            }
++                        } catch (e) { clearTimeout(timer); reject(e); emulator.stop(); }
++                    });
++                    emulator.run();
++                } catch (e) { clearTimeout(timer); reject(e); }
++            });
++        });
++        const cpu = emulator.v86.cpu;
++        expect(dialogs).toBe(2); expect(variantCalls).toBe(2);
++        expect(cpu.reg32[4] >>> 0).toBe(STACK);
++        expect(cpu.instruction_pointer[0] >>> 0).toBe(DONE + 1);
++        expect([3, 6, 7, 5].map(r => cpu.reg32[r] >>> 0)).toEqual([0x11223344, 0x22334455, 0x33445566, 0x44556677]);
++        expect(manager!.getPendingCount()).toBe(0);
++        expect(manager!.getForensicState().suspendedFrames).toHaveLength(0);
++        expect(callbackFlow.snapshot().events.filter(e => e.phase === 'variant-init')).toHaveLength(2);
++    } finally {
++        emulator.stop();
++        system.process = saved.process; system.scheduler = saved.scheduler; system.isExiting = saved.exiting;
++        callbackFlow.configure(false);
++    }
++}, 10000);
