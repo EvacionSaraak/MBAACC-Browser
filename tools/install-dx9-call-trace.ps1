@@ -1,27 +1,14 @@
-# Apply a bounded DX9 call-path probe to a local BottleShip checkout.
-# Run from the BottleShip directory; no git, bun, or game files are touched.
+# MBAACC DX9 call-path trace. Windows PowerShell 5.1 compatible (ASCII).
 $ErrorActionPreference = 'Stop'
 $root = (Get-Location).Path
-$paths = @('src/worker/modules/d3d9/device.ts', 'src/worker/modules/d3d9/fast-path.ts')
-foreach ($p in $paths) {
-  if (-not (Test-Path (Join-Path $root $p))) { throw "Missing $p — run from your BottleShip checkout." }
+$deviceRel = 'src/worker/modules/d3d9/device.ts'
+$fastRel = 'src/worker/modules/d3d9/fast-path.ts'
+$devicePath = Join-Path $root $deviceRel
+$fastPath = Join-Path $root $fastRel
+if (-not (Test-Path $devicePath) -or -not (Test-Path $fastPath)) {
+    throw 'Run this script from the BottleShip checkout containing src/worker/modules/d3d9.'
 }
-function Install-Probe([string]$relative, [string]$entry, [string[]]$names, [bool]$fast) {
-  $file = Join-Path $root $relative
-  $source = [System.IO.File]::ReadAllText($file)
-  if ($source.Contains('MBAACC-DX9-TRACE')) { Write-Host "Already patched: $relative"; return }
-  $anchor = "export function $entry"
-  if (-not $source.Contains($anchor)) { throw "Cannot find $anchor in $relative" }
-  $helper = @'
-const mbaaccDx9TraceSeen = new Set<string>();
-function mbaaccDx9Trace(name: string): void {
-    if (mbaaccDx9TraceSeen.has(name)) return;
-    mbaaccDx9TraceSeen.add(name);
-    Logger.log(LogCategory.D3D9, `[MBAACC-DX9-TRACE] ${name}`);
-}
-'@
-  # Avoid PowerShell interpolating TypeScript backticks; use a simple string.
-  $helper = @'
+$helper = @'
 const mbaaccDx9TraceSeen = new Set<string>();
 function mbaaccDx9Trace(name: string): void {
     if (mbaaccDx9TraceSeen.has(name)) return;
@@ -29,32 +16,59 @@ function mbaaccDx9Trace(name: string): void {
     Logger.log(LogCategory.D3D9, '[MBAACC-DX9-TRACE] ' + name);
 }
 '@
-  $updated = $source.Replace($anchor, $helper + [Environment]::NewLine + $anchor)
-  foreach ($name in $names) {
-    if ($fast) {
-      $pattern = "(dispatcher\.registerFastPath\('d3d9', 'IDirect3DDevice9_$name', \(esp: number, view: DataView\): number => \{)"
-      $tag = "$name / fastpath"
-    } else {
-      $pattern = "(exports\['IDirect3DDevice9_$name'\] = \([^\r\n]*=> \{)"
-      $tag = "$name / normal"
-    }
-    $re = [regex]::new($pattern)
-    if (-not $re.IsMatch($updated)) { throw "Could not instrument $name in $relative; nothing saved." }
-    $updated = $re.Replace($updated, ('$1' + [Environment]::NewLine + "        mbaaccDx9Trace('$tag');"), 1)
-  }
-  if ($fast) {
-    foreach ($name in @('DrawPrimitive','DrawIndexedPrimitive')) {
-      $argCount = if ($name -eq 'DrawPrimitive') { 4 } else { 7 }
-      $pattern = "(dispatcher\.registerWriteBufferFunction\('d3d9', 'IDirect3DDevice9_$name', $argCount,\s*\(_mem8: Uint8Array, mem32: Uint32Array, ptr: number\) => \{)"
-      $re = [regex]::new($pattern)
-      if (-not $re.IsMatch($updated)) { throw "Could not instrument WBUF $name; nothing saved." }
-      $updated = $re.Replace($updated, ('$1' + [Environment]::NewLine + "                mbaaccDx9Trace('$name / WBUF');"), 1)
-    }
-  }
-  [System.IO.File]::Copy($file, "$file.mbaacc-before-trace.bak", $true)
-  [System.IO.File]::WriteAllText($file, $updated, [System.Text.UTF8Encoding]::new($false))
-  Write-Host "Patched $relative (backup saved)" -ForegroundColor Green
+function Add-Trace([string]$text, [string]$needle, [string]$label) {
+    if (-not $text.Contains($needle)) { throw ('Cannot locate hook: ' + $label) }
+    $replacement = $needle + [Environment]::NewLine + "        mbaaccDx9Trace('$label');"
+    return $text.Replace($needle, $replacement)
 }
-Install-Probe $paths[0] 'createDeviceExports(): Record<string, ThunkImplementation> {' @('BeginScene','EndScene','Clear','Present','DrawPrimitive','DrawIndexedPrimitive','DrawPrimitiveUP','DrawIndexedPrimitiveUP') $false
-Install-Probe $paths[1] 'registerFastPathD3D9Functions(dispatcher: HleDispatcher): void {' @('DrawPrimitive','DrawIndexedPrimitive','DrawPrimitiveUP') $true
-Write-Host 'DX9 probe installed. Restart the Vite server; then launch MBAACC and inspect Debug Logs > Load Recent for [MBAACC-DX9-TRACE].' -ForegroundColor Cyan
+function Save-Source([string]$path, [string]$newText) {
+    $backup = $path + '.mbaacc-before-trace.bak'
+    if (-not (Test-Path $backup)) { Copy-Item -LiteralPath $path -Destination $backup }
+    [System.IO.File]::WriteAllText($path, $newText, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host ('Patched: ' + $path) -ForegroundColor Green
+}
+$source = [System.IO.File]::ReadAllText($devicePath)
+if ($source.Contains('[MBAACC-DX9-TRACE]')) {
+    Write-Host 'Normal DX9 handlers already instrumented.'
+} else {
+    $anchor = 'export function createDeviceExports(): Record<string, ThunkImplementation> {'
+    if (-not $source.Contains($anchor)) { throw 'Unsupported BottleShip version: device exports missing' }
+    $source = $source.Replace($anchor, $helper + [Environment]::NewLine + $anchor)
+    foreach ($name in @('BeginScene','EndScene','Clear','Present','DrawPrimitive','DrawIndexedPrimitive','DrawPrimitiveUP','DrawIndexedPrimitiveUP')) {
+        $needle = "exports['IDirect3DDevice9_" + $name + "'] = "
+        $start = $source.IndexOf($needle)
+        if ($start -lt 0) { throw ('Missing normal DX9 handler: ' + $name) }
+        $body = $source.IndexOf('=> {', $start)
+        if ($body -lt 0 -or ($body - $start) -gt 160) { throw ('Missing body of ' + $name) }
+        $point = $body + 4
+        $source = $source.Insert($point, [Environment]::NewLine + "        mbaaccDx9Trace('$name / normal');")
+    }
+    Save-Source $devicePath $source
+}
+$source = [System.IO.File]::ReadAllText($fastPath)
+if ($source.Contains('[MBAACC-DX9-TRACE]')) {
+    Write-Host 'Fast DX9 handlers already instrumented.'
+} else {
+    $anchor = 'export function registerFastPathD3D9Functions(dispatcher: HleDispatcher): void {'
+    if (-not $source.Contains($anchor)) { throw 'Unsupported BottleShip version: fast path registration missing' }
+    $source = $source.Replace($anchor, $helper + [Environment]::NewLine + $anchor)
+    foreach ($name in @('DrawPrimitive','DrawIndexedPrimitive','DrawPrimitiveUP')) {
+        $needle = "dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_" + $name + "',"
+        $start = $source.IndexOf($needle)
+        if ($start -lt 0) { throw ('Missing fast DX9 handler: ' + $name) }
+        $body = $source.IndexOf('=> {', $start)
+        if ($body -lt 0 -or ($body - $start) -gt 180) { throw ('Missing fast handler body: ' + $name) }
+        $source = $source.Insert($body + 4, [Environment]::NewLine + "        mbaaccDx9Trace('$name / fast');")
+    }
+    foreach ($name in @('DrawPrimitive','DrawIndexedPrimitive')) {
+        $count = if ($name -eq 'DrawPrimitive') { '4' } else { '7' }
+        $needle = "dispatcher.registerWriteBufferFunction('d3d9', 'IDirect3DDevice9_" + $name + "', " + $count + ","
+        $start = $source.IndexOf($needle)
+        if ($start -lt 0) { throw ('Missing buffered DX9 handler: ' + $name) }
+        $body = $source.IndexOf('=> {', $start)
+        if ($body -lt 0 -or ($body - $start) -gt 210) { throw ('Missing buffered handler body: ' + $name) }
+        $source = $source.Insert($body + 4, [Environment]::NewLine + "                mbaaccDx9Trace('$name / buffer');")
+    }
+    Save-Source $fastPath $source
+}
+Write-Host 'DX9 tracing installed. Restart Vite and check Debug Logs for [MBAACC-DX9-TRACE].' -ForegroundColor Cyan
