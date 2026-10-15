@@ -1,0 +1,45 @@
+diff --git a/src/worker/api/d3dx9.api.ts b/src/worker/api/d3dx9.api.ts
+--- a/src/worker/api/d3dx9.api.ts
++++ b/src/worker/api/d3dx9.api.ts
+@@ -55,5 +55,6 @@ export const d3dx9Module: ModuleDescriptor = {
+         makeFunc("D3DXVec3Normalize", 2),
+         makeFunc("D3DXVec3TransformCoord", 3),
++        makeFunc("D3DXCreateTexture", 8, { onUnimplemented: "hresult" }),
+         makeFunc("D3DXCreateTextureFromFileA", 3, { onUnimplemented: "hresult" }),
+         makeFunc("D3DXCreateTextureFromFileW", 3, { onUnimplemented: "hresult" }),
+         makeFunc("D3DXCreateTextureFromFileInMemory", 4, { onUnimplemented: "hresult" }),
+diff --git a/src/worker/modules/d3dx9/textures.ts b/src/worker/modules/d3dx9/textures.ts
+--- a/src/worker/modules/d3dx9/textures.ts
++++ b/src/worker/modules/d3dx9/textures.ts
+@@ -239,5 +239,31 @@ export function createTextureExports(): Record<string, ThunkImplementation> {
+     const exports: Record<string, ThunkImplementation> = {};
+ 
++    // D3DXCreateTexture(Device, Width, Height, MipLevels, Usage, Format, Pool, ppTexture).
++    // Unlike loading a texture from a file this does not populate pixel data.
++    // Delegate allocation and the COM out-pointer to the existing D3D9 resource registry.
++    exports['D3DXCreateTexture'] = (_ctx, _mem, args) => {
++        const device = args[0] >>> 0;
++        const rawWidth = args[1] >>> 0;
++        const rawHeight = args[2] >>> 0;
++        const mipLevels = args[3] >>> 0;
++        const usage = args[4] >>> 0;
++        const rawFormat = args[5] >>> 0;
++        const rawPool = args[6] >>> 0;
++        const ppTexture = args[7] >>> 0;
++        if (!device || !ppTexture) return D3DERR_INVALIDCALL;
++        // D3DX_DEFAULT dimensions are 256; other D3DX defaults follow the
++        // existing texture loaders' managed-pool and A8R8G8B8 conventions.
++        const width = rawWidth === D3DX_DEFAULT ? 256 : rawWidth;
++        const height = rawHeight === D3DX_DEFAULT ? 256 : rawHeight;
++        const format = rawFormat === D3DX_DEFAULT || rawFormat === 0
++            ? D3DFMT_A8R8G8B8 : rawFormat;
++        const pool = rawPool === D3DX_DEFAULT ? D3DPOOL_MANAGED : rawPool;
++        const normalizedUsage = usage === D3DX_DEFAULT ? 0 : usage;
++        if (!width || !height) return D3DERR_INVALIDCALL;
++        return createGuestTexture(device, width, height, mipLevels,
++            normalizedUsage, format, pool, ppTexture);
++    };
++
+     exports['D3DXFilterTexture'] = (_ctx, _mem, args) => {
+         return d3dxFilterTexture(args[0] >>> 0, args[2] >>> 0, args[3] >>> 0);
+     };
