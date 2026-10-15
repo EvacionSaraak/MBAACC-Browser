@@ -41,14 +41,6 @@ $replacement = @'
         return mbaaccDrawResult;
 '@
 $method = $method.Replace($last, $replacement.TrimEnd())
-# Record the drop reason in this handler, including exits reached before recording.
-$method = [regex]::Replace($method, 'return d3d9DropDraw\("([^"]+)"\);', 'return (mbaaccTrace ? (Logger.log(LogCategory.D3D9, "[MBAACC-DX9-UP-FATE] dropped: $1"), d3d9DropDraw("$1")) : d3d9DropDraw("$1"));')
-# TypeScript does not permit the JS comma expression in this form in all versions.
-$method = $method.Replace('return (mbaaccTrace ? (Logger.log', 'return (mbaaccTrace ? (Logger.log')
-# Use a static helper for all dropped paths, preserving return semantics.
-$method = [regex]::Replace($method,
-    'return \(mbaaccTrace \? \(Logger\.log\(LogCategory\.D3D9, "\[MBAACC-DX9-UP-FATE\] dropped: ([^"]+)"\), d3d9DropDraw\("\1"\)\) : d3d9DropDraw\("\1"\)\);',
-    'if (mbaaccTrace) Logger.log(LogCategory.D3D9, "[MBAACC-DX9-UP-FATE] dropped: $1"); return d3d9DropDraw("$1");')
 $out = $before + $method + $after
 $backup = $p + '.mbaacc-before-up-fate.bak'
 if (-not (Test-Path $backup)) { [System.IO.File]::Copy($p, $backup) }
