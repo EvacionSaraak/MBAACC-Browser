@@ -1,5 +1,9 @@
 # MBAACC-Browser
 
+**GitHub Pages site:** [https://evacionsaraak.github.io/MBAACC-Browser/](https://evacionsaraak.github.io/MBAACC-Browser/)
+
+> The site is an experimental executable analyzer, **not a playable version of MBAACC**. Pages deployment may need to be enabled or verified in repository settings.
+
 Goal: play the original **MELTY BLOOD Actress Again Current Code** in a browser, hosted as a static GitHub Pages site, by running the real Windows executable through an existing browser-based Win32/DirectX runtime ([BottleShip](https://github.com/jenissimo/bottleship), built on a fork of [v86](https://github.com/copy/v86)). No emulator install, no streaming, no backend.
 
 > **Status: Phase 1 (foundation). The game does not run yet.** Nothing here claims MBAACC compatibility; see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
