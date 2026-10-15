@@ -1,6 +1,8 @@
 // Classifies log evidence; does not infer success from missing log messages.
 // Accepts a plaintext "Load Recent" export; never uploads or echoes log lines.
 import { createReadStream } from 'node:fs';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline';
 
 export const RULES = Object.freeze({
@@ -38,7 +40,7 @@ export async function summarizeFile(filename) {
   }
   return summary;
 }
-if (process.argv[1] && import.meta.url === new URL('file://' + process.argv[1].replaceAll('\\', '/')).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const filename = process.argv[2];
   if (!filename) {
     console.error('Usage: node tools/triage-bottleship-log.mjs <local-log.txt>');
