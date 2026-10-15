@@ -1,4 +1,5 @@
 import { Logger } from "./logger";
+import { makeCompatibilityReport, type CompatibilityReport } from "./report";
 import { parsePe, PeError } from "./pe";
 import { reportCompatibility, EXPECTED_FILES } from "./compat";
 
@@ -15,12 +16,17 @@ window.addEventListener("error", (ev) => log.error(`Uncaught: ${ev.message}`));
 window.addEventListener("unhandledrejection", (ev) => log.error(`Unhandled rejection: ${String(ev.reason)}`));
 
 let files: File[] = [];
+let report: CompatibilityReport | null = null;
+const exportButton = $<HTMLButtonElement>("export");
+exportButton.disabled = true;
 
 function relPath(f: File): string {
   return (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
 }
 
 async function analyze(): Promise<void> {
+  report = null;
+  exportButton.disabled = true;
   const exe = files.find((f) => EXPECTED_FILES.some((n) => f.name.toLowerCase() === n.toLowerCase()));
   if (!exe) {
     statusEl.textContent = "MBAA.exe not found in the selected folder.";
@@ -29,7 +35,10 @@ async function analyze(): Promise<void> {
   }
   try {
     log.info(`Parsing ${relPath(exe)} (${exe.size} bytes) locally; nothing is uploaded.`);
-    reportCompatibility(parsePe(await exe.arrayBuffer()), log);
+    const parsed = parsePe(await exe.arrayBuffer());
+    reportCompatibility(parsed, log);
+    report = makeCompatibilityReport(parsed);
+    exportButton.disabled = false;
     statusEl.textContent = "Executable parsed (static analysis only). Execution is not implemented yet.";
   } catch (e) {
     statusEl.textContent = "Failed to parse executable.";
@@ -44,6 +53,16 @@ $<HTMLInputElement>("picker").addEventListener("change", (ev) => {
   $("count").textContent = `${files.length} file(s) selected`;
   log.info(`Selected ${files.length} file(s).`);
   void analyze();
+});
+
+exportButton.addEventListener("click", () => {
+  if (!report) return;
+  const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "mbaacc-compatibility-report.json";
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
 
 $<HTMLButtonElement>("run").addEventListener("click", () => {
