@@ -44,3 +44,20 @@ BottleShip 0.7 has modules for D3DX9, DirectInput, DirectSound and 32-bit Window
 **Next practical experiment:** on a machine holding an extracted Community Edition installation, import the complete game folder into BottleShip's browser interface and attempt to launch `MBAA.exe`. Preserve runtime logs, missing-API errors and screenshots. Do not upload proprietary files to GitHub or make claims of gameplay until confirmed.
 
 The report alone cannot detect dynamic DLL loading, file format assumptions, packer behavior, graphics correctness, or runtime timing issues.
+
+## First actual BottleShip execution trace — 2026-10-15
+
+A full community-edition WGB completed the import wizard and attempted to execute `rom/MBAA.exe` in BottleShip. **The game did not reach the title screen.** This supersedes earlier statements that no execution had been attempted.
+
+Observed crash:
+- `Unhandled access violation — EIP 0x8680, address 0x0`, thread T1.
+- Last completed thunk: `oleaut32:ord_8` (VariantInit), returning `0x0`.
+- A prior warning during `user32:CreateDialogParamA`: `wild EBP` outside the guest stack, with an explicit caveat that EBP may be used as scratch in frame-pointer-omitting code.
+- `ole32:CoCreateInstance` returned `0x80040154` (class not registered); not established as causal.
+- User32 dialog APIs, timer, thread creation and filesystem APIs were exercised; no confirmed menu or D3D initialization.
+
+Upstream BottleShip's `src/worker/api/oleaut32.api.ts` maps `ord_8` to VariantInit, and `src/worker/modules/oleaut32.ts` implements it by clearing 16 bytes for a non-null valid pointer. The latest thunk is a proximity clue, **not proof that VariantInit itself caused the fault**.
+
+Investigation priority: reproduce with the same full WGB locally; preserve an intact crash report, then inspect guest code around the failing EIP and the caller near `0x41720d`. Trace the dialog callback and async guest/host stack restoration around `CreateDialogParamA` / `MoveWindow`. Determine whether the fault is an invalid return/jump, callback convention mismatch, or unrelated memory corruption. Avoid game-specific hacks and do not assume this is a D3D failure.
+
+No proprietary assets or executable bytes are committed. This section contains derived diagnostic metadata only.
