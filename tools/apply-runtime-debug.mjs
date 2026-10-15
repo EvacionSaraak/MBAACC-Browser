@@ -20,4 +20,4 @@ if (run(['rev-parse', 'HEAD']) !== BOTTLESHIP_REVISION) throw new Error(`Expecte
 if (run(['status', '--porcelain', '--untracked-files=no'])) throw new Error('Tracked source changes exist. Use a clean checkout; this helper will not reset them.');
 run(['apply', '--check', patch]);
 if (apply) run(['apply', patch]);
-console.log(apply ? 'Source instrumentation and synthetic tests applied. No runtime fix is claimed.' : 'Patch validated; pass --apply to apply the source instrumentation.');
+console.log(apply ? 'Pinned runtime diagnostics, tested startup fixes, and synthetic tests applied. Main-menu compatibility is not established.' : 'Patch validated; pass --apply to apply the source instrumentation.');
