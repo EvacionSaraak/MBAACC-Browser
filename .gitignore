@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.exe
+*.dll
+*.p
+*.pat
+*.hfp
+*.wgb
