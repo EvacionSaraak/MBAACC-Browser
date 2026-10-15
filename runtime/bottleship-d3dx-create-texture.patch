@@ -1,7 +1,7 @@
 diff --git a/src/worker/api/d3dx9.api.ts b/src/worker/api/d3dx9.api.ts
 --- a/src/worker/api/d3dx9.api.ts
 +++ b/src/worker/api/d3dx9.api.ts
-@@ -55,6 +55,7 @@ export const d3dx9Module: ModuleDescriptor = {
+@@ -55,5 +55,6 @@ export const d3dx9Module: ModuleDescriptor = {
          makeFunc("D3DXVec3Normalize", 2),
          makeFunc("D3DXVec3TransformCoord", 3),
 +        makeFunc("D3DXCreateTexture", 8, { onUnimplemented: "hresult" }),
@@ -11,7 +11,7 @@ diff --git a/src/worker/api/d3dx9.api.ts b/src/worker/api/d3dx9.api.ts
 diff --git a/src/worker/modules/d3dx9/textures.ts b/src/worker/modules/d3dx9/textures.ts
 --- a/src/worker/modules/d3dx9/textures.ts
 +++ b/src/worker/modules/d3dx9/textures.ts
-@@ -239,6 +239,32 @@ export function createTextureExports(): Record<string, ThunkImplementation> {
+@@ -239,5 +239,31 @@ export function createTextureExports(): Record<string, ThunkImplementation> {
      const exports: Record<string, ThunkImplementation> = {};
  
 +    // D3DXCreateTexture(Device, Width, Height, MipLevels, Usage, Format, Pool, ppTexture).
