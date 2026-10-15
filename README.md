@@ -12,6 +12,7 @@ Goal: play the original **MELTY BLOOD Actress Again Current Code** in a browser,
 - Static TypeScript/Vite frontend with a folder picker for your own legally obtained MBAACC files (processed locally, never uploaded, never committed).
 - Static PE32 analysis of `MBAA.exe` (headers, sections, imported DLLs/functions) with a log of components needing emulation. **No code is executed.**
 - Environment diagnostics (WebGPU, SharedArrayBuffer, OPFS) and a copyable log.
+- Downloadable JSON compatibility report listing PE headers and imports only (no executable bytes).
 - GitHub Pages deployment via Actions.
 
 ## Development
