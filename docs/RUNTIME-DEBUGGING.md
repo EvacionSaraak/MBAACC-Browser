@@ -1,6 +1,14 @@
 # MBAACC browser runtime debugging
 
-## Current evidence (2026-10-15)
+## Current status
+
+The patched local runtime now executes MBAACC, displays its configuration dialog,
+and responds to Enter without the two reproduced startup faults. The next view
+is white with presents but no draw calls; no title or main menu is confirmed.
+See [the instrumented results](#instrumented-local-results-and-confirmed-fixes-2026-10-15)
+and [local launch instructions](../runtime/README.md).
+
+## Original evidence (2026-10-15)
 
 A private full-game WGB was imported successfully into BottleShip and launched. Guest code executed; the application crashed before a confirmed rendered MBAACC title screen.
 
@@ -135,3 +143,91 @@ Compare the COM failure, subsequent callback/async events, and the first bad
 target/ESP before implementing a runtime fix. Then retest the same WGB and record
 the next failure or an actually rendered, interactive title/main menu. Packaging,
 passing synthetic tests, and a crash at a different address are not menu progress.
+
+## Instrumented local results and confirmed fixes (2026-10-15)
+
+This section supersedes the earlier local-server blocker and unsupported-DxDiag
+status. Runtime revisions remain pinned as above; testing used Bun 1.4.3 and the
+Codex in-app Chromium browser. The exact browser version was not captured.
+
+### Storage and archive loading
+
+The private WGB is about 2.08 GiB. Its manifest named `MBAA.exe`, but the archive
+contained `rom/MBAA.exe`. This produced an entrypoint error and triggered the
+loader's broad fallback to OPFS staging. A separate local WGB was streamed to
+disk with only that manifest field corrected; non-manifest entry names, sizes,
+and CRCs matched. Neither original installation nor original WGB was changed.
+
+The corrected copy exposed a second, independent archive bug: its writer emits
+a ZIP64 locator/EOCD even though ordinary EOCD fields have no sentinel values.
+BottleShip ignored those records and counted their 76 bytes as an SFX prefix,
+then looked for the central directory at the wrong offset. The tiny synthetic
+regression fails before the parser fix and passes afterward, including an SFX
+prefix. This is an implementation bug, not JavaScript's maximum ArrayBuffer size.
+The earlier full-folder allocation failure was not reproduced in this run; its
+precise limit is not established by the ZIP64 regression. This workflow avoids
+rebuilding the folder in the browser.
+
+The local loopback range server and corrected WGB now reach guest execution.
+Existing cached OPFS copies may be reused; this run does not establish that every
+launch made zero OPFS writes. See runtime/README.md for the disk-backed workflow.
+
+### First fault: missing DxDiag objects
+
+In the same instrumented run, DxDiag CoCreateInstance returned `0x80040154` and
+a null object. VariantInit received a valid pointer. Read-only local disassembly
+confirmed that the later failing path dereferenced a null DxDiag container and
+called its GetProp slot. The bootloader escape at `0x7c07` followed that null
+vtable access. No proprietary instructions or executable bytes are included here.
+
+A partial SDK-based DxDiag implementation now returns real provider/container
+objects, validates Initialize, supports enumeration and selected string properties,
+and manages references and caller-owned BSTRs. Values describe BottleShip's
+emulated machine, not the host PC. Unknown properties/interfaces still fail.
+With this implementation, the initial fault disappears and the game completes
+its diagnostic queries and reaches Direct3D capability checks.
+
+The earlier trace's `argCount: 32` was reusable argument-buffer capacity, not
+VariantInit's signature. The trace now reports `argCount: 1` and labels the
+separate `argumentBufferLength` explicitly.
+
+### Second fault: deferred callback stack cleanup
+
+With DxDiag available, a later fault occurred at `0x8680` (illegal instruction,
+address `0x40000c`), last API EndPaint. The callback trace showed cdecl returns
+leaving 16 argument bytes on the stack. The immediate-return path restored its
+saved frame, but the deferred modal-pump path resumed the return stub without
+removing those arguments. Its RET could therefore consume a window handle as
+a code address instead of returning to the parked caller.
+
+The fix normalizes that stack only for an exactly recognized cdecl return while
+the CPU still points at that callback's return stub. It does not overwrite a
+synchronous continuation that already installed a new callback. The synthetic
+x86 test now covers an idle deferred return and re-entry, in addition to the
+existing nested stdcall case. It fails with the cleanup removed and passes with
+it restored. The test also corrects DataView construction to honor the actual
+v86 memory byte offset and verifies VariantInit writes exactly 16 bytes.
+
+### Actual browser progress and remaining issue
+
+With both fixes, the real MBAACC executable displays its configuration dialog
+and remains alive. Focusing the game and pressing Enter dismisses that dialog.
+The subsequent view is white. Debug GPU reports an active D3D9 backend and
+thousands of presents, but zero draw calls, textures, vertex buffers or pipelines.
+The worker continues input polling and Sleep calls. Its general heartbeat reports
+zero rendered frames. No title, main menu, gameplay, or audio was confirmed.
+
+Enabling live log streaming during another run made that tab unresponsive; the
+user closed the tabs. Prefer bounded **Load Recent** snapshots while investigating
+the white screen. The next task is to capture graphics initialization and file
+access results across the Enter transition, then identify why no drawing reaches
+the backend. No speculative rendering bypass has been added.
+
+Validation: 90 targeted runtime tests pass across 10 files; TypeScript and Vite
+production build pass. The build used Node to invoke Vite directly because the
+local standalone Bun package lacks the `bunx` shim. Existing chunk-size warnings
+and the native-test `import.meta.glob` warning remain.
+
+MBAACC-Browser validation: six frontend tests, TypeScript, and its Vite production
+build pass. The exported patch applied successfully to a fresh pinned checkout;
+reverse-apply validation also passed.

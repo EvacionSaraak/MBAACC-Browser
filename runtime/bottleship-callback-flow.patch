@@ -1,3 +1,19 @@
+diff --git a/packages/formats/src/zip/index.ts b/packages/formats/src/zip/index.ts
+index d91b0dd..552fdae 100644
+--- a/packages/formats/src/zip/index.ts
++++ b/packages/formats/src/zip/index.ts
+@@ -315,7 +315,10 @@ export class ZipArchive {
+ 
+         // ZIP64: any sentinel in the 32-bit EOCD means the real values live in the ZIP64 EOCD
+         // record, which the locator (immediately before the EOCD) points at.
+-        if (cdSize === U32_MAX || cdOffset === U32_MAX || entryCount === U16_MAX) {
++        // Some writers emit ZIP64 records before the 32-bit fields overflow.
++        // Their locator still determines where the central directory ends.
++        const hasZip64Locator = eocdOffset >= 20 && view.getUint32(eocdOffset - 20, true) === EOCD64_LOC_SIGNATURE;
++        if (hasZip64Locator || cdSize === U32_MAX || cdOffset === U32_MAX || entryCount === U16_MAX) {
+             const locRel = eocdOffset - 20;
+             if (locRel < 0 || view.getUint32(locRel, true) !== EOCD64_LOC_SIGNATURE) {
+                 throw new Error("ZIP64 EOCD locator not found");
 diff --git a/src/guest-report.ts b/src/guest-report.ts
 index b737147..d6b2bfb 100644
 --- a/src/guest-report.ts
@@ -44,10 +60,10 @@ index d284303..f5399b4 100644
          cfg.enabled = true;
 diff --git a/src/worker/core/diagnostics/callback-flow.ts b/src/worker/core/diagnostics/callback-flow.ts
 new file mode 100644
-index 0000000..8567f05
+index 0000000..f222d12
 --- /dev/null
 +++ b/src/worker/core/diagnostics/callback-flow.ts
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,51 @@
 +/** Opt-in, bounded control-flow telemetry. Never stores guest bytes or argument payloads. */
 +export interface CallbackFlowEvent {
 +    phase: 'frame-save' | 'callback-invoke' | 'callback-return' | 'frame-restore' |
@@ -66,6 +82,7 @@ index 0000000..8567f05
 +    pointer?: number;
 +    pointerValid?: boolean;
 +    argCount?: number;
++    argumentBufferLength?: number;
 +    clsid?: string;
 +    iid?: string;
 +    result?: number;
@@ -98,6 +115,19 @@ index 0000000..8567f05
 +
 +// Explicit local development opt-in; production builds are silent by default.
 +if (import.meta.env?.VITE_BS_CALLBACK_FLOW === "1") callbackFlow.configure(true);
+diff --git a/src/worker/core/logger.ts b/src/worker/core/logger.ts
+index be74408..8448e96 100644
+--- a/src/worker/core/logger.ts
++++ b/src/worker/core/logger.ts
+@@ -209,7 +209,7 @@ const BATCH_TIMEOUT_MS = 16; // One frame at 60fps
+ 
+ class LoggerImpl {
+     private buffer: LogEntry[] = [];
+-    private bufferSize = 50;
++    private bufferSize = import.meta.env?.VITE_BS_CALLBACK_FLOW === "1" ? 2048 : 50;
+     private globalLevel: LogLevel = LogLevel.NORMAL;
+     private categoryLevels: Map<LogCategory, LogLevel> = new Map();
+     private writeIndex = 0;
 diff --git a/src/worker/core/system.ts b/src/worker/core/system.ts
 index 625ded5..58b8606 100644
 --- a/src/worker/core/system.ts
@@ -126,7 +156,7 @@ index 625ded5..58b8606 100644
              if (fault.threadId != null && dispatcher?.getLastWinApiCallsForThread) {
                  fault.crashThreadCalls = dispatcher.getLastWinApiCallsForThread(fault.threadId, 24);
 diff --git a/src/worker/core/thunking/callback-manager.ts b/src/worker/core/thunking/callback-manager.ts
-index 1eb259f..deee86a 100644
+index 1eb259f..aff55df 100644
 --- a/src/worker/core/thunking/callback-manager.ts
 +++ b/src/worker/core/thunking/callback-manager.ts
 @@ -12,6 +12,7 @@
@@ -161,7 +191,27 @@ index 1eb259f..deee86a 100644
              cpu.reg32[0] = finalValue >>> 0;
              cpu.reg32[4] = postEsp;
              if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
-@@ -722,6 +733,11 @@ export class CallbackManager {
+@@ -637,6 +648,19 @@ export class CallbackManager {
+         if (callback.completeThunk) {
+             const result = callback.completeThunk(returnValue);
+             if (result === null) {
++                // A deferred chain returns through this stub into its parked caller.
++                // cdecl dialog procedures leave their arguments above that return slot.
++                // Normalize only while still in this stub: a synchronous continuation
++                // may already have installed a new callback's EIP/ESP.
++                if ((cpu.instruction_pointer[0] >>> 0) === ((stub.address + 12) >>> 0) &&
++                    driftCdecl === 0 && driftStdcall !== 0 && callback.espBeforeInvoke !== undefined) {
++                    const savedEaxSlot = (callback.espBeforeInvoke - 4) >>> 0;
++                    guardStackWrite(savedEaxSlot, 4, 'callback:deferredCdeclReturn');
++                    const currentMemory = this.getMemory();
++                    new DataView(currentMemory.buffer, currentMemory.byteOffset, currentMemory.byteLength)
++                        .setUint32(savedEaxSlot, returnValue, true);
++                    cpu.reg32[4] = savedEaxSlot;
++                }
+                 // Intermediate callback in a suspended-thunk chain is complete.
+                 // Release current stub/record before chaining next callback to avoid stale in-flight state.
+                 this.releaseCallback(functionId, stub);
+@@ -722,6 +746,11 @@ export class CallbackManager {
                  return;
              }
  
@@ -173,7 +223,7 @@ index 1eb259f..deee86a 100644
              const preWriteEsp = cpu.reg32[4];
              const preWriteEip = cpu.instruction_pointer?.[0] ?? 0;
              this.restoreCalleeSavedAcrossCallback(frameIndex, frameId, this.frameSource[frameIndex] ?? '');
-@@ -1242,6 +1258,9 @@ export class CallbackManager {
+@@ -1242,6 +1271,9 @@ export class CallbackManager {
          Logger.verbose(LogCategory.CALLBACK,
              `Saved suspended thunk frame ${frameId} (depth=${this.frameStackDepth}): ` +
              `T${threadId} ESP=0x${esp.toString(16)} RET=0x${returnAddr.toString(16)} cleanup=${stackCleanup}`);
@@ -183,7 +233,7 @@ index 1eb259f..deee86a 100644
          return frameId;
      }
  
-@@ -1475,6 +1494,11 @@ export class CallbackManager {
+@@ -1475,6 +1507,11 @@ export class CallbackManager {
              invocation.ownerThreadId ?? 0,
              callbackAddress >>> 0
          );
@@ -236,16 +286,190 @@ index ddd29aa..08b56b1 100644
          this.lastExpectedEspAfterReturn = finalEsp;
          this.lastThunkIdAfterReturn = info.functionId;
          this.lastThunkNameAfterReturn = name;
+diff --git a/src/worker/modules/ole32-dxdiag.ts b/src/worker/modules/ole32-dxdiag.ts
+new file mode 100644
+index 0000000..9b50979
+--- /dev/null
++++ b/src/worker/modules/ole32-dxdiag.ts
+@@ -0,0 +1,159 @@
++/** Partial DxDiag over the emulated machine, never the host PC.
++ * ABI: Microsoft SDK dxdiag.h. Unknown properties/interfaces return errors.
++ */
++import type { Process } from '../core/process';
++import type { ThunkImplementation } from '../core/thunking/thunk-dispatcher';
++import { installComVtable, type ComVtableMethod } from '../core/com/install-com-vtable';
++import { readGuidFromMem } from '../core/com/typelib/typelib-types';
++import { isValidAddress } from '../core/memory/address-guard';
++import { adapterDescription, adapterDriverDll, adapterDriverVersion } from '../backends/webgpu/shared/dx-adapter-identifier';
++
++export const DXDIAG_CLSID = 'a65b8071-3bfe-4213-9a5b-491da4461ca7';
++export const DXDIAG_PROVIDER_IID = '9c6b4cb0-23f8-49cc-a3ed-45a55000a6d2';
++export const DXDIAG_CONTAINER_IID = '7d0f462f-4064-4862-bc7f-933e5058c10f';
++const UNKNOWN_IID = '00000000-0000-0000-c000-000000000046';
++const INVALID = 0x80070057, POINTER = 0x80004003, NO_INTERFACE = 0x80004002;
++const NO_MEMORY = 0x8007000e, NOT_INITIALIZED = 0x800401f0, SMALL_BUFFER = 0x8007007a;
++export interface DxNode { props: Record<string, string>; children: Record<string, DxNode> }
++export interface DxHost {
++    memory(): Uint8Array;
++    valid(ptr: number, size: number, write: boolean): boolean;
++    alloc(size: number): number;
++    free(ptr: number): void;
++    install(name: string, methods: ComVtableMethod[], handlers: Record<string, ThunkImplementation>): number;
++}
++interface ObjectState { refs: number; kind: 'provider' | 'container'; initialized: boolean; node: DxNode }
++export class DxDiag {
++    private objects = new Map<number, ObjectState>();
++    private tables = new Map<string, number>();
++    constructor(private host: DxHost, private root: DxNode) {}
++    reset(): void { this.objects.clear(); this.tables.clear(); }
++    private view(): DataView { const m = this.host.memory(); return new DataView(m.buffer, m.byteOffset, m.byteLength); }
++    private write(ptr: number, value: number): void { this.view().setUint32(ptr, value, true); }
++    private wide(ptr: number): string | null {
++        if (!ptr) return null;
++        let value = '';
++        for (let i = 0; i < 32768; i++) {
++            if (!this.host.valid(ptr + i * 2, 2, false)) return null;
++            const ch = this.view().getUint16(ptr + i * 2, true);
++            if (!ch) return value;
++            value += String.fromCharCode(ch);
++        }
++        return null;
++    }
++    private putWide(value: string, ptr: number, capacity: number): number {
++        if (!Number.isInteger(capacity) || capacity < 1 || capacity > 0x7fffffff || !this.host.valid(ptr, capacity * 2, true)) return INVALID;
++        if (capacity <= value.length) { this.view().setUint16(ptr, 0, true); return SMALL_BUFFER; }
++        for (let i = 0; i <= value.length; i++) this.view().setUint16(ptr + i * 2, i === value.length ? 0 : value.charCodeAt(i), true);
++        return 0;
++    }
++    create(iid: string, out: number): number {
++        if (!this.host.valid(out, 4, true)) return POINTER;
++        this.write(out, 0);
++        if (iid !== DXDIAG_PROVIDER_IID && iid !== UNKNOWN_IID) return NO_INTERFACE;
++        return this.publish('provider', this.root, out);
++    }
++    private publish(kind: 'provider' | 'container', node: DxNode, out: number): number {
++        const table = this.table(kind);
++        if (!table) return NO_MEMORY;
++        const ptr = this.host.alloc(4);
++        if (!ptr) return NO_MEMORY;
++        this.write(ptr, table);
++        this.objects.set(ptr, { refs: 1, kind, node, initialized: false });
++        this.write(out, ptr);
++        return 0;
++    }
++    private table(kind: 'provider' | 'container'): number {
++        const cached = this.tables.get(kind);
++        if (cached) return cached;
++        const definitions: [string, number][] = [['QueryInterface',3],['AddRef',1],['Release',1],
++            ...(kind === 'provider' ? [['Initialize',2],['GetRootContainer',2]] :
++                [['GetNumberOfChildContainers',2],['EnumChildContainerNames',4],['GetChildContainer',3],
++                 ['GetNumberOfProps',2],['EnumPropNames',4],['GetProp',3]]) as [string,number][]];
++        const handlers: Record<string, ThunkImplementation> = {};
++        const methods = definitions.map(([name,argCount]) => {
++            handlers[name] = (_ctx,_mem,args) => this.invoke(kind,name,args);
++            return {name,argCount,stackCleanupBytes:argCount*4};
++        });
++        const table = this.host.install(`ole32_dxdiag_${kind}`, methods, handlers);
++        if (table) this.tables.set(kind,table);
++        return table;
++    }
++    private invoke(kind: 'provider' | 'container', method: string, args: number[]): number {
++        const ptr = args[0] >>> 0, obj = this.objects.get(ptr);
++        if (!obj || obj.kind !== kind) return INVALID;
++        const a = args[1] >>> 0, b = args[2] >>> 0;
++        if (method === 'AddRef') return ++obj.refs;
++        if (method === 'Release') {
++            if (--obj.refs === 0) { this.objects.delete(ptr); this.host.free(ptr); return 0; }
++            return obj.refs;
++        }
++        if (method === 'QueryInterface') {
++            if (!this.host.valid(b,4,true)) return POINTER;
++            this.write(b,0);
++            if (!this.host.valid(a,16,false)) return POINTER;
++            const iid = readGuidFromMem(this.host.memory(),a);
++            if (iid !== UNKNOWN_IID && iid !== (kind === 'provider' ? DXDIAG_PROVIDER_IID : DXDIAG_CONTAINER_IID)) return NO_INTERFACE;
++            obj.refs++; this.write(b,ptr); return 0;
++        }
++        if (method === 'Initialize') {
++            if (!this.host.valid(a,16,false)) return INVALID;
++            const v = this.view();
++            if (v.getUint32(a,true) !== 16 || v.getUint32(a+4,true) !== 111 || v.getUint32(a+12,true) !== 0) return INVALID;
++            obj.initialized = true; return 0;
++        }
++        if (method === 'GetRootContainer') {
++            if (!this.host.valid(a,4,true)) return POINTER;
++            this.write(a,0);
++            return obj.initialized ? this.publish('container',obj.node,a) : NOT_INITIALIZED;
++        }
++        if (method === 'GetChildContainer') {
++            if (!this.host.valid(b,4,true)) return POINTER;
++            this.write(b,0);
++            const name = this.wide(a);
++            if (!name) return INVALID;
++            let node: DxNode | undefined = obj.node;
++            for (const part of name.split('.')) node = node && Object.hasOwn(node.children, part) ? node.children[part] : undefined;
++            return node ? this.publish('container',node,b) : INVALID;
++        }
++        const names = Object.keys(method.includes('Prop') ? obj.node.props : obj.node.children);
++        if (method.startsWith('GetNumberOf')) {
++            if (!this.host.valid(a,4,true)) return POINTER;
++            this.write(a,names.length); return 0;
++        }
++        if (method.startsWith('Enum')) return a < names.length ? this.putWide(names[a],b,args[3] >>> 0) : INVALID;
++        if (method === 'GetProp') {
++            if (!this.host.valid(b,16,true)) return POINTER;
++            const name = this.wide(a);
++            if (name === null || !Object.hasOwn(obj.node.props,name)) return INVALID;
++            const value = obj.node.props[name];
++            const allocation = this.host.alloc(4 + (value.length+1)*2);
++            if (!allocation) return NO_MEMORY;
++            this.write(allocation,value.length*2);
++            this.putWide(value,allocation+4,value.length+1);
++            const mem = this.host.memory(); mem.fill(0,b,b+16);
++            this.view().setUint16(b,8,true); // VT_BSTR; owned by caller / VariantClear.
++            this.write(b+8,allocation+4);
++            return 0;
++        }
++        return INVALID;
++    }
++}
++export function createDxDiag(process: Process): DxDiag {
++    const version = adapterDriverVersion();
++    const driverVersion = [48n,32n,16n,0n].map(shift => Number((version >> shift) & 0xffffn)).join('.');
++    const display: DxNode = {props: {
++        szDescription: adapterDescription(), szDriverName: adapterDriverDll(), szDriverVersion: driverVersion,
++    }, children:{}};
++    const root: DxNode = {props:{},children:{
++        DxDiag_SystemInfo: {props:{szProcessorEnglish:'BottleShip x86 emulator'},children:{}},
++        DxDiag_DisplayDevices: {props:{},children:{'0':display}},
++    }};
++    return new DxDiag({
++        memory: () => process.getCurrentMemory(),
++        valid: (ptr,size,write) => !!ptr && isValidAddress(process.getCurrentMemory(),ptr,size,write ? 'rw' : 'r'),
++        alloc: size => process.memory.alloc(size),
++        free: ptr => { process.memory.free(ptr); },
++        install: (moduleName,methods,handlers) => installComVtable(process,{moduleName,methods,handlers})?.vtableAddr ?? 0,
++    },root);
++}
 diff --git a/src/worker/modules/ole32.ts b/src/worker/modules/ole32.ts
-index 173ea2d..1f79ab4 100644
+index 173ea2d..fd4b05c 100644
 --- a/src/worker/modules/ole32.ts
 +++ b/src/worker/modules/ole32.ts
-@@ -1,3 +1,4 @@
+@@ -1,3 +1,5 @@
++import { createDxDiag, DXDIAG_CLSID, type DxDiag } from './ole32-dxdiag';
 +import { callbackFlow } from '../core/diagnostics/callback-flow';
  import { IModule } from "../core/module";
  import { Process } from "../core/process";
  import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
-@@ -185,18 +186,30 @@ export class Ole32 implements IModule {
+@@ -39,6 +41,7 @@ export class Ole32 implements IModule {
+     name = "ole32";
+     exports: Record<string, ThunkImplementation> = {};
+     private process!: Process;
++    private dxdiag?: DxDiag;
+     private iunknownStubs: { QueryInterface: number; AddRef: number; Release: number } | null = null;
+     private guidState = 0xa341316c;
+     private guidCounter = 1;
+@@ -185,18 +188,30 @@ export class Ole32 implements IModule {
              }
  
              // Generic native inproc COM (registry / ROM DLL → DllGetClassObject chain)
@@ -278,8 +502,28 @@ index 173ea2d..1f79ab4 100644
          }) as ThunkImplementation;
  
          // CoSetProxyBlanket - set authentication on a proxy. Everything here is
+@@ -920,6 +935,10 @@ export class Ole32 implements IModule {
+         iidNormalized: string,
+     ): number {
+         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
++        if (clsidNormalized === DXDIAG_CLSID) {
++            this.dxdiag ??= createDxDiag(this.process);
++            return this.dxdiag.create(iidNormalized, ppv);
++        }
+         const interfaceRegistry = InterfaceRegistry.getInstance();
+         const process = this.process;
+ 
+@@ -1340,6 +1359,8 @@ export class Ole32 implements IModule {
+      * THUNK_CODE. Stubs are regenerated in recreateVTables() after the new layout exists.
+      */
+     reset(): void {
++        this.dxdiag?.reset();
++        this.dxdiag = undefined;
+         comApartments.reset();
+         this.dragDropRegistrations.reset();
+         this.objectAddressMap.clear();
 diff --git a/src/worker/modules/oleaut32.ts b/src/worker/modules/oleaut32.ts
-index 9297290..23bc84b 100644
+index 9297290..e1223f1 100644
 --- a/src/worker/modules/oleaut32.ts
 +++ b/src/worker/modules/oleaut32.ts
 @@ -1,3 +1,4 @@
@@ -294,7 +538,7 @@ index 9297290..23bc84b 100644
 +            if (callbackFlow.isEnabled()) callbackFlow.record({ phase: 'variant-init',
 +                threadId: System.getInstance().scheduler.getCurrentThreadId() >>> 0,
 +                esp: ctx.esp >>> 0, pointer: pvarg, pointerValid: !!pvarg && pvarg + 16 <= mem.length,
-+                argCount: args.length, cleanupBytes: 4 });
++                argCount: 1, argumentBufferLength: args.length, cleanupBytes: 4 });
              if (pvarg && pvarg + 16 <= mem.length) {
                  mem.fill(0, pvarg, pvarg + 16);
              }
@@ -349,32 +593,107 @@ index 0000000..a608004
 +});
 diff --git a/tools/tests/dxdiag-availability.test.ts b/tools/tests/dxdiag-availability.test.ts
 new file mode 100644
-index 0000000..3b9a3bd
+index 0000000..336860c
 --- /dev/null
 +++ b/tools/tests/dxdiag-availability.test.ts
 @@ -0,0 +1,16 @@
 +import { expect, test } from 'bun:test';
 +import { Ole32 } from '../../src/worker/modules/ole32';
 +
-+test('DxDiag provider is currently unsupported, returning an error and a null object', () => {
++test('Unknown COM classes still return an error and a null object', () => {
 +    const ole32 = new Ole32();
 +    (ole32 as any).process = {modules: new Map()};
 +    const mem = new Uint8Array(0x1000), out = 0x100;
 +    const view = new DataView(mem.buffer);
 +    view.setUint32(out, 0xfeedface, true);
-+    // Microsoft dxdiag.h, not extracted game content.
-+    const clsid = 'a65b8071-3bfe-4213-9a5b-491da4461ca7';
++    // An unknown synthetic CLSID must not acquire the DxDiag implementation.
++    const clsid = '00000000-0000-0000-0000-000000000001';
 +    const iid = '9c6b4cb0-23f8-49cc-a3ed-45a55000a6d2';
 +    const hr = (ole32 as any).coCreateInstanceHle(mem, out, clsid, iid, clsid, iid);
 +    expect(hr >>> 0).toBe(0x80040154);
 +    expect(view.getUint32(out, true)).toBe(0);
 +});
+diff --git a/tools/tests/dxdiag-provider.test.ts b/tools/tests/dxdiag-provider.test.ts
+new file mode 100644
+index 0000000..0cc3daa
+--- /dev/null
++++ b/tools/tests/dxdiag-provider.test.ts
+@@ -0,0 +1,69 @@
++import { expect, test } from 'bun:test';
++import { DxDiag, DXDIAG_PROVIDER_IID, DXDIAG_CONTAINER_IID } from '../../src/worker/modules/ole32-dxdiag';
++import { writeGuidToMem } from '../../src/worker/core/com/typelib/typelib-types';
++
++function harness() {
++    const memory = new Uint8Array(0x10000), view = new DataView(memory.buffer);
++    const tables = new Map<number, any>(), freed: number[] = []; let next = 0x1000;
++    const diag = new DxDiag({
++        memory:()=>memory, valid:(p,n)=>p>0 && n>=0 && p+n<=memory.length,
++        alloc:n=>{const p=next;next+=Math.ceil(n/4)*4;return p;}, free:p=>{freed.push(p);},
++        install:(_name,methods,handlers)=>{const p=next;next+=128;tables.set(p,{methods,handlers});return p;},
++    },{props:{},children:{DxDiag_SystemInfo:{props:{szProcessorEnglish:'Virtual CPU'},children:{}}}});
++    const call=(p:number,name:string,...args:number[])=>tables.get(view.getUint32(p,true)).handlers[name]({},memory,[p,...args]);
++    const wide=(p:number,s:string)=>{for(let i=0;i<=s.length;i++)view.setUint16(p+i*2,s.charCodeAt(i)||0,true);};
++    return {diag,memory,view,call,wide,tables,freed};
++}
++test('DxDiag initialization, child enumeration and owned BSTR property',()=>{
++    const h=harness(); expect(h.diag.create(DXDIAG_PROVIDER_IID,0x100)).toBe(0);
++    const provider=h.view.getUint32(0x100,true);
++    expect(h.call(provider,'GetRootContainer',0x104)).toBe(0x800401f0);
++    expect(h.view.getUint32(0x104,true)).toBe(0);
++    h.view.setUint32(0x200,16,true);h.view.setUint32(0x204,111,true);
++    expect(h.call(provider,'Initialize',0x200)).toBe(0);
++    expect(h.call(provider,'GetRootContainer',0x104)).toBe(0);
++    const root=h.view.getUint32(0x104,true);
++    expect(h.call(root,'GetNumberOfChildContainers',0x108)).toBe(0);
++    expect(h.view.getUint32(0x108,true)).toBe(1);
++    expect(h.call(root,'EnumChildContainerNames',0,0x300,2)).toBe(0x8007007a);
++    expect(h.call(root,'EnumChildContainerNames',1,0x300,100)).toBe(0x80070057);
++    expect(h.call(root,'EnumChildContainerNames',0,0x300,100)).toBe(0);
++    expect(h.call(root,'GetChildContainer',0x300,0x10c)).toBe(0);
++    const child=h.view.getUint32(0x10c,true);
++    for (const name of ['__proto__', 'constructor', 'toString']) {
++        h.wide(0x300,name);
++        expect(h.call(root,'GetChildContainer',0x300,0x110)).toBe(0x80070057);
++        expect(h.view.getUint32(0x110,true)).toBe(0);
++    }
++    h.wide(0x300,'szProcessorEnglish');expect(h.call(child,'GetProp',0x300,0x400)).toBe(0);
++    expect(h.view.getUint16(0x400,true)).toBe(8);
++    const bstr=h.view.getUint32(0x408,true);
++    expect(h.view.getUint32(bstr-4,true)).toBe(22);
++    expect(new TextDecoder('utf-16le').decode(h.memory.slice(bstr,bstr+22))).toBe('Virtual CPU');
++    expect(h.view.getUint16(bstr+22,true)).toBe(0);
++    h.wide(0x300,'unknown');expect(h.call(child,'GetProp',0x300,0x400)).toBe(0x80070057);
++    expect(h.call(provider,'Release')).toBe(0);
++    // A container keeps its own lifetime when the provider is released.
++    expect(h.call(child,'GetNumberOfProps',0x108)).toBe(0);
++    expect(h.call(child,'Release')).toBe(0);expect(h.freed).toContain(child);
++    expect(h.call(root,'Release')).toBe(0);
++    for(const {methods} of h.tables.values()) for(const m of methods) expect(m.stackCleanupBytes).toBe(m.argCount*4);
++});
++test('DxDiag rejects invalid pointers, header, reserved field and unsupported interfaces',()=>{
++    const h=harness();expect(h.diag.create(DXDIAG_PROVIDER_IID,0)).toBe(0x80004003);
++    expect(h.diag.create(DXDIAG_CONTAINER_IID,0x100)).toBe(0x80004002);
++    expect(h.view.getUint32(0x100,true)).toBe(0);
++    h.diag.create(DXDIAG_PROVIDER_IID,0x100);const provider=h.view.getUint32(0x100,true);
++    expect(h.call(provider,'Initialize',0xfffc)).toBe(0x80070057);
++    h.view.setUint32(0x200,16,true);h.view.setUint32(0x204,110,true);
++    expect(h.call(provider,'Initialize',0x200)).toBe(0x80070057);
++    h.view.setUint32(0x204,111,true);h.view.setUint32(0x20c,1,true);
++    expect(h.call(provider,'Initialize',0x200)).toBe(0x80070057);
++    writeGuidToMem(h.memory,0x300,DXDIAG_CONTAINER_IID);
++    expect(h.call(provider,'QueryInterface',0x300,0x104)).toBe(0x80004002);
++    writeGuidToMem(h.memory,0x300,DXDIAG_PROVIDER_IID);
++    expect(h.call(provider,'QueryInterface',0x300,0x104)).toBe(0);
++    expect(h.view.getUint32(0x104,true)).toBe(provider);
++    expect(h.call(provider,'Release')).toBe(1);expect(h.call(provider,'Release')).toBe(0);
++    h.diag.reset();expect(h.call(provider,'AddRef')).toBe(0x80070057);
++});
 diff --git a/tools/tests/nested-dialog-x86.test.ts b/tools/tests/nested-dialog-x86.test.ts
 new file mode 100644
-index 0000000..5b07bb4
+index 0000000..f9ad8ec
 --- /dev/null
 +++ b/tools/tests/nested-dialog-x86.test.ts
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,129 @@
 +/** Handwritten synthetic x86, no game bytes. Runs the real v86 CPU and CallbackManager.
 + * The API entry is a modeless-dialog ABI seam, not the full user32 window implementation.
 + */
@@ -386,7 +705,7 @@ index 0000000..5b07bb4
 +import { Oleaut32 } from '../../src/worker/modules/oleaut32';
 +import { callbackFlow } from '../../src/worker/core/diagnostics/callback-flow';
 +
-+test('nested modeless-dialog ABI callbacks call VariantInit and return to the original EIP/ESP', async () => {
++for (const deferredCdecl of [false, true]) test(`nested dialog ABI callbacks (${deferredCdecl ? 'cdecl deferred pump' : 'stdcall immediate'}) preserve EIP/ESP`, async () => {
 +    const BASE = 0x100000, STACK = 0x300000, PORT = 0xb077;
 +    const OUTER = BASE + 0x200, INNER = BASE + 0x300;
 +    const DIALOG = BASE + 0x400, NESTED = BASE + 0x420, VARIANT = BASE + 0x440;
@@ -409,7 +728,7 @@ index 0000000..5b07bb4
 +    at = OUTER - BASE;
 +    emit(0x55, 0x89, 0xe5, 0x53, 0x56, 0x57); // save callee-saved registers
 +    args5(); call(NESTED); variant();
-+    emit(0x5f, 0x5e, 0x5b, 0x5d); mov(0, 1); emit(0xc2, 16, 0);
++    emit(0x5f, 0x5e, 0x5b, 0x5d); mov(0, 1); if (deferredCdecl) emit(0xc3); else emit(0xc2, 16, 0);
 +    at = INNER - BASE;
 +    emit(0x55, 0x89, 0xe5, 0x53, 0x56, 0x57); variant();
 +    emit(0x5f, 0x5e, 0x5b, 0x5d); mov(0, 2); emit(0xc2, 16, 0);
@@ -417,11 +736,12 @@ index 0000000..5b07bb4
 +        at = address - BASE;
 +        mov(0, id!); mov(2, PORT); emit(0xef, 0xc2, pop!, 0);
 +    }
++    at = 0x500; emit(0xeb, 0xfe); // idle spin, no proprietary code
 +    const system = System.getInstance();
 +    const saved = {process: system.process, scheduler: system.scheduler, exiting: system.isExiting};
 +    const emulator = new V86({autostart: false, memory_size: 16 * 1024 * 1024, log_level: 0});
 +    let manager: CallbackManager | undefined;
-+    let variantCalls = 0, dialogs = 0;
++    let variantCalls = 0, dialogs = 0, outerReturns = 0;
 +    callbackFlow.configure(true);
 +    try {
 +        await new Promise<void>((resolve, reject) => {
@@ -452,15 +772,36 @@ index 0000000..5b07bb4
 +                            const esp = cpu.reg32[4] >>> 0;
 +                            if (manager!.isCallbackReturn(id >>> 0)) manager!.handleCallbackReturn(id >>> 0);
 +                            else if (id === 3) {
-+                                const ptr = new DataView(mem.buffer).getUint32(esp + 4, true);
++                                const ptr = new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(esp + 4, true);
++                                expect(ptr).toBeGreaterThan(STACK - 0x10000);
++                                expect(ptr + 16).toBeLessThanOrEqual(STACK);
++                                mem.fill(0xa5, ptr, ptr + 16);
++                                const before = mem[ptr - 1], after = mem[ptr + 16];
 +                                oleaut.exports.ord_8!({esp} as any, mem, [ptr]);
++                                expect(Array.from(mem.slice(ptr, ptr + 16))).toEqual(Array(16).fill(0));
++                                expect([mem[ptr - 1], mem[ptr + 16]]).toEqual([before, after]);
 +                                variantCalls++;
 +                                cpu.reg32[0] = 0;
 +                            } else {
 +                                dialogs++;
 +                                const frame = manager!.saveSuspendedThunkContext({esp}, 20, 'synthetic-modeless-dialog');
++                                const complete = () => {
++                                    if (id === 1 && deferredCdecl && outerReturns++ === 0) {
++                                        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(esp,BASE+0x500,true);
++                                        setTimeout(() => {
++                                            try {
++                                                expect(cpu.instruction_pointer[0] >>> 0).toBe(BASE+0x500);
++                                                expect(cpu.reg32[4] >>> 0).toBe(esp+4);
++                                                manager!.invokeCallback(OUTER,[1,0x110,0,0],0,complete,false,'synthetic-pump',frame);
++                                            } catch (e) { clearTimeout(timer); reject(e); emulator.stop(); }
++                                        }, 20);
++                                        return null;
++                                    }
++                                    return 0x10000 + id;
++                                };
++                                if (id === 1 && deferredCdecl) new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(esp,BASE+0x500,true);
 +                                manager!.invokeCallback(id === 1 ? OUTER : INNER, [1, 0x110, 0, 0], 0,
-+                                    () => 0x10000 + id, false, 'synthetic-WM_INITDIALOG', frame);
++                                    complete, false, 'synthetic-WM_INITDIALOG', frame);
 +                            }
 +                        } catch (e) { clearTimeout(timer); reject(e); emulator.stop(); }
 +                    });
@@ -469,16 +810,45 @@ index 0000000..5b07bb4
 +            });
 +        });
 +        const cpu = emulator.v86.cpu;
-+        expect(dialogs).toBe(2); expect(variantCalls).toBe(2);
++        expect(dialogs).toBe(deferredCdecl ? 3 : 2); expect(variantCalls).toBe(deferredCdecl ? 4 : 2);
 +        expect(cpu.reg32[4] >>> 0).toBe(STACK);
 +        expect(cpu.instruction_pointer[0] >>> 0).toBe(DONE + 1);
 +        expect([3, 6, 7, 5].map(r => cpu.reg32[r] >>> 0)).toEqual([0x11223344, 0x22334455, 0x33445566, 0x44556677]);
 +        expect(manager!.getPendingCount()).toBe(0);
 +        expect(manager!.getForensicState().suspendedFrames).toHaveLength(0);
-+        expect(callbackFlow.snapshot().events.filter(e => e.phase === 'variant-init')).toHaveLength(2);
++        expect(callbackFlow.snapshot().events.filter(e => e.phase === 'variant-init')).toHaveLength(deferredCdecl ? 4 : 2);
 +    } finally {
 +        emulator.stop();
 +        system.process = saved.process; system.scheduler = saved.scheduler; system.isExiting = saved.exiting;
 +        callbackFlow.configure(false);
 +    }
 +}, 10000);
+diff --git a/tools/tests/zip64-reader.test.ts b/tools/tests/zip64-reader.test.ts
+index a5a2390..376f1ad 100644
+--- a/tools/tests/zip64-reader.test.ts
++++ b/tools/tests/zip64-reader.test.ts
+@@ -139,3 +139,24 @@ describe('ZipArchive rejects a broken ZIP64 archive', () => {
+         await expect(a.init()).rejects.toThrow(/ZIP64 EOCD locator/);
+     });
+ });
++
++test('ZIP64 locator without EOCD sentinels preserves directory and data offsets', async () => {
++    const bytes = buildZip(MEMBERS, true);
++    const view = new DataView(bytes.buffer);
++    const end = bytes.length - 22;
++    const record = end - 20 - 56;
++    view.setUint16(end + 8, MEMBERS.length, true);
++    view.setUint16(end + 10, MEMBERS.length, true);
++    view.setUint32(end + 12, Number(view.getBigUint64(record + 40, true)), true);
++    view.setUint32(end + 16, Number(view.getBigUint64(record + 48, true)), true);
++    for (const prefix of [0, 128]) {
++        const input = new Uint8Array(prefix + bytes.length);
++        input.set(bytes, prefix);
++        const archive = new ZipArchive(new BufferSource(input));
++        await archive.init();
++        expect(archive.listEntries().map(e => e.name)).toEqual(MEMBERS.map(e => e.name));
++        for (const member of MEMBERS) {
++            expect(await archive.readEntry(archive.getEntry(member.name)!)).toEqual(member.data);
++        }
++    }
++});
